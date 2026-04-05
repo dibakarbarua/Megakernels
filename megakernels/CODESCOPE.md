@@ -52,6 +52,73 @@ the global KV caches.
 This is where the object-oriented PyTorch module graph gets flattened into
 megakernel-friendly arrays.
 
+NOTES: 
+- This is pretty much the exact PyTorch implementation of the model in PyTorch.
+- There is a wrapper object that instantiates the Llama model (layers+LMHead)
+  - Then there are additional utilities that flattens model parameters
+- the setup_caches() function creates a stacked KV cache per layer
+- the stack_params() is the key flattening function as shown
+
+```
+self_attns = [x.self_attn for x in layers]
+        mlps = [x.mlp for x in layers]
+
+        o_projs = [x.o_proj for x in self_attns]
+        self_attn_lns = [x.input_layernorm for x in self_attns]
+
+        mlp_lns = [x.input_layernorm for x in mlps]
+        up_projs = [x.up_proj for x in mlps]
+        gate_projs = [x.gate_proj for x in mlps]
+        down_projs = [x.down_proj for x in mlps]
+
+        stacked_o_proj = stack_and_reassign(o_projs, "weight")
+        stacked_self_attn_ln_weights = stack_and_reassign(self_attn_lns, "weight")
+        stacked_mlp_ln_weights = stack_and_reassign(mlp_lns, "weight")
+        stacked_up_proj = stack_and_reassign(up_projs, "weight")
+        stacked_gate_proj = stack_and_reassign(gate_projs, "weight")
+        stacked_down_proj = stack_and_reassign(down_projs, "weight")
+
+        qkv_weights = []
+        for self_attn in self_attns:
+            cat_weight = torch.cat(
+                [
+                    self_attn.q_proj.weight,
+                    self_attn.k_proj.weight,
+                    self_attn.v_proj.weight,
+                ],
+                dim=0,
+            )
+            qkv_weights.append(cat_weight)
+
+        stacked_qkv_weights = torch.stack(qkv_weights, dim=0)
+
+        for i, self_attn in enumerate(self_attns):
+            qkv_weight = stacked_qkv_weights[i]
+            q_weight, k_weight, v_weight = qkv_weight.split(
+                [
+                    self.config.num_attention_heads * self.config.head_dim,
+                    self.config.num_key_value_heads * self.config.head_dim,
+                    self.config.num_key_value_heads * self.config.head_dim,
+                ],
+                dim=0,
+            )
+
+            self_attn.q_proj.weight[:] = q_weight
+            self_attn.k_proj.weight[:] = k_weight
+            self_attn.v_proj.weight[:] = v_weight
+
+        self.stacked_params = StackedParams(
+            qkv_proj=stacked_qkv_weights,
+            o_proj=stacked_o_proj,
+            attn_ln_weight=stacked_self_attn_ln_weights,
+            mlp_ln_weight=stacked_mlp_ln_weights,
+            up_proj=stacked_up_proj,
+            gate_proj=stacked_gate_proj,
+            down_proj=stacked_down_proj,
+        )
+
+```
+
 ### 2. Build mode-specific globals and instructions
 
 `dispatch.py` picks either the latency or throughput builder.

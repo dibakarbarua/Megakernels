@@ -88,7 +88,14 @@ This directory is depended on by:
 Read the files in this order:
 
 1. `instructions.py`
+
 2. `scheduler.py`
+NOTE: Key Function!
+- make_globals() function creates stacked params objects and other HW footprint metadata
+  - QUESTION: Dig into what the block sizes mean, is this num_warps per SM?
+- make_dag()
+- make_dag_layer()
+
 3. `python_vm.py`
 4. `mk.py`
 

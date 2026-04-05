@@ -306,7 +306,7 @@ def make_dag_layer(
                 kv_head_idx=kv_head_idx,
                 num_partials=num_attention_partitions,
                 partial_idx=partial_idx,
-            )
+            ) # type: ignore
 
             block_indices = []
 
