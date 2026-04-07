@@ -6,7 +6,7 @@ This directory contains the user-facing entrypoints.
 
 These scripts answer practical questions such as:
 
-- how do I run generation?
+- how do I run generation?We i
 - how do I compare PyTorch vs VM vs megakernel?
 - how do I launch a small REPL?
 - how do I profile the reference model?
@@ -15,7 +15,7 @@ These scripts answer practical questions such as:
 ## Files and roles
 
 - `generate.py`
-  Main research driver. Loads a model, runs prefill, builds a schedule, and
+  Main driver. Loads a model, runs prefill, builds a schedule, and
   executes generation under one of several backends.
 - `llama_repl.py`
   Interactive chat loop around the megakernel or PyTorch backend.

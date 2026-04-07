@@ -68,6 +68,8 @@ translate the model into a sequence or DAG of instruction objects.
 
 Those instruction objects describe logical work such as:
 
+TODO: Map out the computations in each layer and the sizes of weights and activations
+
 - pre-attention RMS norm
 - QKV projection with RoPE and KV append
 - attention decode

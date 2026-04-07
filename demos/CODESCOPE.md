@@ -20,6 +20,8 @@ The key distinction is:
 
 `demos/*` depends on:
 
+QUESTION: Need to understand the exact nature of operation for any one operation
+
 - `include/megakernel.cuh`
 - `include/config.cuh`
 - `include/util.cuh`

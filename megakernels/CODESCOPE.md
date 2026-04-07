@@ -136,6 +136,29 @@ instruction to a 32-int record.
 
 The resulting buffers are stored directly on `schedule.globs`.
 
+KEY CONCEPTS:
+- Instruction
+  - opcode, prev_opcode, serialize(returns full 32-int instruction encoding)
+  - The definition of an instruction is usually a single op / fused ops for a given layer.
+- DAG
+  - Each operation is a DAG node in a graph
+  - The operation will likely depend on prior operations completing
+    - Example earlier operations in its layer, all ops in previous layers.
+  - Once we distill the entire model in a DAG, we encode the computations
+- Schedule
+  - A schedule consists of a statically pre-scheduled sequence of instructions on each SM
+  - The flattened model is represented as a DAG (above) of instructions and dependencies
+  - All SMs are initially available to schedule work
+  - The Scheduler creates a heap of SMs and Instructions
+    - The SM heap returns SM that will be available soonest
+    - The instruction heap returns the longest "ready" instruction
+  - Finally we create the static schedule by going "instruction-by-instruction"
+    - We map each instruction to an SM and add it to its "instruction queue"
+- ScheduleBuiler
+  - wrapper class to return Schedule
+- SM Allocations (TBD)
+  - Different assignments to load balance and avoid SM quantization
+  
 ### 4. Run one decode step
 
 `generators.py` embeds the current token, writes `hidden_states`, sets `pos_id`,
@@ -158,6 +181,30 @@ write into the shared logits buffer, and Python does the token selection.
 - `llama.py` -> `model_types.py`, `utils.py`
 - `demos/{latency,throughput}` -> `instructions.py`, `python_vm.py`,
   `scheduler.py`, `llama.py`
+
+## Encoding each sequence
+
+```
+class BatchState:
+    input_ids: Tensor
+    position_ids: Tensor | None = None
+    seq_len: int | None = None
+    output_ids: Tensor | None = None
+    hidden_states: Tensor | None = None
+    position_embeddings: tuple[Tensor, Tensor] | None = None
+
+    kv_indices: Tensor | None = None
+    kv_indptr: Tensor | None = None
+    kv_last_page_lens: Tensor | None = None
+    kv_seqlens: Tensor | None = None
+    qo_indptr: Tensor | None = None
+    prefill_wrapper: Any | None = None
+    decode_wrapper: Any | None = None
+
+    def __post_init__(self):
+        if self.seq_len is None:
+            self.seq_len = self.input_ids.shape[1]
+```
 
 ## Reading advice
 

@@ -103,9 +103,41 @@ def assign_dag_to_sms(schedule: Schedule) -> list[list[Instruction]]:
 
     # schedule.end_node.calc_priority(globs)
 
+    """
+    In scheduler.py (line 109), this heap is being used as a 
+        priority queue of SM availability, not of instructions.
+
+    sm_heap = [(0, i) for i in range(sm_count)]
+    heapq.heapify(sm_heap)
+    This means:
+
+    create one entry per SM
+    each entry is (time_available, sm_index)
+    initially every SM is free at time 0
+    So if sm_count == 4, the heap starts as:
+
+    [(0, 0), (0, 1), (0, 2), (0, 3)]
+    Then later at scheduler.py (line 129), the code does:
+
+    sm_time, sm_idx = heapq.heappop(sm_heap)
+    That picks the SM that becomes available earliest. 
+    If two SMs are tied, Python compares the second tuple element, 
+        so the lower SM index wins.
+
+    After assigning work, it pushes the SM back with its new finish time
+
+    heapq.heappush(sm_heap, (end_time, sm_idx))
+    So the heap is continuously tracking:
+
+    which SM is free next
+    when that SM will be free
+    Short version: this heap is a compact way to always grab the 
+        least busy / earliest available SM during scheduling.
+    """
     sm_count = globs.sm_count()
     sm_queues = [[] for _ in range(sm_count)]
 
+    # SM Availability Heap
     sm_heap = [(0, i) for i in range(sm_count)]
     heapq.heapify(sm_heap)
 
@@ -118,10 +150,12 @@ def assign_dag_to_sms(schedule: Schedule) -> list[list[Instruction]]:
     for node in ready_nodes:
         idx = node_to_idx[node]
         # max cost first
+        # This is a min-heap, we want to schedule most expensive instrn first
         ready_heap.append((-node.instruction.cost(globs), idx))
 
     heapq.heapify(ready_heap)
 
+    # Instruction (DAG Node) readiness heap
     while ready_heap:
         ready_time, idx = heapq.heappop(ready_heap)
         node = idx_to_node[idx]
@@ -131,6 +165,14 @@ def assign_dag_to_sms(schedule: Schedule) -> list[list[Instruction]]:
         # print(f"assigning instruction {node.instruction} to sm {sm_idx}")
 
         # start_time = max(ready_time, sm_time)
+        """
+        For this loop to be timing-correct, 
+        the child should be inserted with its true ready time, 
+        and then scheduling should use:
+
+            child_ready_time = max(dep.end_time for dep in child.dependencies)
+            start_time = max(child_ready_time, sm_time)
+        """
         start_time = sm_time
 
         end_time = start_time + node.instruction.cost(globs)
@@ -284,6 +326,9 @@ def tensorize_instructions(
 ):
     num_sms = globs.sm_count()
 
+    # These instruction queues are across SMs
+    # For unbalanced queues, some SMs will work on NOP instructions in
+    # ... latter waves
     max_queue_len = max(len(queue) for queue in instruction_queues)
     for queue in instruction_queues:
         queue.extend([NoOp()] * (max_queue_len - len(queue)))
