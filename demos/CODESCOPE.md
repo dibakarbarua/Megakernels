@@ -20,7 +20,7 @@ The key distinction is:
 
 `demos/*` depends on:
 
-QUESTION: Need to understand the exact nature of operation for any one operation
+QUESTION: Need to understand the exact nature of operation for any one instruction
 
 - `include/megakernel.cuh`
 - `include/config.cuh`

@@ -206,6 +206,8 @@ class BatchState:
             self.seq_len = self.input_ids.shape[1]
 ```
 
+QUESTION: How is TP sharding working, is this meant to run in a Multi GPU config even with 1B params?
+
 ## Reading advice
 
 Read these next:

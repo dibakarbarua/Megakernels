@@ -1,0 +1,615 @@
+token_id
+  |
+  v
+embedding lookup
+  |
+  v
+hidden[2048]
+  |
+    
+Projection Tensors
+    X          : [1, 2048]
+    Wq         : [2048, 2048]   (conceptually) = 4MB * dtype_size = 8/16MB
+    Q_flat     : [1, 2048]
+    Q_reshaped : [1, 32, 64]
+
+    X   : [1, 2048]
+    Wk  : [2048, 512] conceptually
+    K   : [1, 512] -> reshape -> [1, 8, 64]
+
+    Wv  : [2048, 512] conceptually
+    V   : [1, 512] -> reshape -> [1, 8, 64]
+
+  +--> repeat 16 times ------------------------------------------------------+
+  |                                                                           |
+  |  residual_a = hidden                                                      |
+  |  x = RMSNorm(hidden)                                                      |
+  |  Q = x @ Wq   -> [32 heads, 64 dim]                                       |
+  |  K = x @ Wk   -> [ 8 heads, 64 dim]  =  512 dims                          |
+  |  V = x @ Wv   -> [ 8 heads, 64 dim]  =  512 dims                          |
+  |
+  |    At this point,
+  |        Q is [1, 32, 64]
+  |        K is [1, 8, 64]
+  |        V is [1, 8, 64]
+  |
+  |  apply RoPE to Q and K                                                    |
+  |  append K,V to KV cache at current position                               |
+  |  attn = GQA(Q, K_cache, V_cache)  -> [32 heads, 64 dim] = 2048 dims       |
+  |     attn output = [1, 2048] after concat
+  |     Wo = [2048, 2048]
+  |  hidden = residual_a + (attn @ Wo)                                        |
+  |                                                                           |
+  |  residual_b = hidden                                                      |
+  |  y = RMSNorm(hidden)                                                      |
+  |    Wup =   [2048, 8192]
+  |    Wgate = [2048, 8192]
+  |
+  |  up   = y @ Wup    -> 8192 dims                                           |
+  |  gate = y @ Wgate  -> 8192 dims                                           |
+  |  mlp  = SiLU(gate) * up                                                   |
+  |  hidden = residual_b + (mlp @ Wdown)                                      |
+  |                                                                           |
+  +---------------------------------------------------------------------------+
+  |
+  v
+RMSNorm
+  |
+  v
+logits = hidden @ Wlm
+
+
+HF / logical block
+  RMSNorm + QKV + RoPE + KV append
+    -> LayerNorm_QKV_MatVecRopeAppend   (opcode 1)
+
+  attention(Q against KV cache)
+    -> PartialAttention                 (opcode 2)
+    -> AttentionReduction              (opcode 3, usually skipped here)
+
+  Wo + residual
+    -> O_ProjResidual                  (opcode 4)
+
+  RMSNorm + Wup + Wgate + SiLU*gating
+    -> LayerNormDoubleMatVecSiLU       (opcode 5)
+
+  Wdown + residual
+    -> DownProjResidual                (opcode 6)
+
+After last layer:
+  final RMSNorm + LM head
+    -> RMS_LM_Head                     (opcode 7)
+
+#############################
+#### GPU DATA SHARDING ######
+#############################
+
+**Flattened QKV View**
+
+In this demo, Q, K, and V are concatenated into one stacked projection matrix in [llama.py](/Users/dibakarbarua/Desktop/Code/Megakernels/megakernels/llama.py#L740):
+
+```text
+W_qkv = concat(Wq, Wk, Wv)   shape [3072, 2048]
+x_norm                      shape [2048]
+
+y = W_qkv @ x_norm          shape [3072]
+```
+
+That `3072` output is:
+
+```text
+3072 = 2048(Q) + 512(K) + 512(V)
+     = 128 blocks + 32 blocks + 32 blocks
+     = 192 blocks of size 16
+```
+
+So the scheduler is really partitioning this:
+
+```text
+y[0:3072]
+```
+
+into 192 contiguous 16-element chunks.
+
+**What One Opcode-1 Instruction Owns**
+
+Each opcode-1 instruction has:
+
+```text
+start_output_block_idx
+end_output_block_idx
+```
+
+```text
+for block_idx in range(start_output_block_idx, end_output_block_idx):
+    out = W_qkv[block_idx*16 : (block_idx+1)*16] @ x_norm
+```
+
+Then it decides whether that 16-wide tile belongs to Q, K, or V by its offset:
+
+- blocks `0..127` are Q
+- blocks `128..159` are K
+- blocks `160..191` are V
+
+
+**Why RMSNorm Can Be in the Same Instruction**
+
+RMSNorm is applied to the full input vector `x` before any of the output tiles are produced:
+
+```text
+x          : [2048]
+x_norm     : [2048]
+tile_out   : [16] = W_tile[16, 2048] @ x_norm[2048]
+```
+
+That means every opcode-1 instruction needs access to the full normalized input, but only emits some output tiles.
+
+Conceptually:
+
+```text
+Instruction A:
+  compute x_norm
+  emit y[0:32]
+
+Instruction B:
+  compute x_norm
+  emit y[32:64]
+
+Instruction C:
+  compute x_norm
+  emit y[64:96]
+```
+
+### IMPORTANT
+So yes, some “full-input” work is reused or recomputed per instruction/CTA. 
+That is the price paid to make the output shards independent enough to schedule flexibly.
+
+**A More Concrete Tile Picture**
+
+Because `head_dim = 64` and `block_size = 16`, each head is 4 tiles:
+
+```text
+Q head 0 = blocks 0..3
+Q head 1 = blocks 4..7
+...
+Q head 31 = blocks 124..127
+
+K head 0 = blocks 128..131
+K head 1 = blocks 132..135
+...
+K head 7 = blocks 156..159
+
+V head 0 = blocks 160..163
+...
+V head 7 = blocks 188..191
+```
+
+That is why the barrier logic works in groups of 4 tiles per head in [python_vm.py]
+
+**How This Relates to SMs**
+
+The scheduler does not emit 192 separate QKV instructions. It emits about one instruction per SM, and each instruction covers a range of those 192 tiles in [scheduler.py](/Users/dibakarbarua/Desktop/Code/Megakernels/megakernels/demos/latency/scheduler.py#L125).
+
+So the relationship is:
+
+```text
+logical QKV tiles: 192
+scheduler instructions: about sm_count
+tiles per instruction: a small contiguous range
+```
+
+On H100, with `132` SMs, that means many instructions own 1-2 tiles
+
+```text
+regular kernel tiling:
+  one kernel launch, internal tiling
+
+megakernel here:
+  instruction graph over tiles
+  each instruction = fused program over a tile range
+  resident CTAs/SMs pull and execute those instructions
+```
+
+Your shape intuition is right, but I’d rewrite it as:
+
+```text
+x_norm           : [2048]
+W_qkv            : [3072, 2048]
+tile b of W_qkv  : [16, 2048]
+output tile b    : [16]
+```
+
+rather than `Q = [2048,16,128]`, because the scheduler is not primarily thinking in “head-shaped tensors”; it is thinking in a flat concatenated output dimension split into 16-wide blocks.
+
+If you want, I can next draw the exact mapping from `block_idx -> (Q/K/V, head_idx, dim_range)` for all 192 QKV blocks.
+
+
+#######################
+#### GPU DATA FLOW ####
+#######################
+
+HBM buffers
+  hidden_states[2048]
+  stacked weights[layer, ...]
+  q_post_rope[2048]
+  attn_out[2048]
+  silu_out[8192]
+  k_cache[layer, pos, kv_head, 64]
+  v_cache[layer, pos, kv_head, 64]
+  barriers[layer, opcode, 48]
+        |
+        v
++------------------------------------------------------------------+
+| GPU grid: one CTA per SM                                         |
+| each CTA pulls an instruction                                    |
+| each CTA uses shared-memory pages + semaphores + barrier counters|
++------------------------------------------------------------------+
+
+Opcode 1: QKV path
+  partition: output-feature blocks of 16 dims
+  SMs get slices of the 192 QKV blocks
+  writes:
+    Q blocks -> q_post_rope
+    K blocks -> k_cache[layer, pos, kv_head, dim_chunk]
+    V blocks -> v_cache[layer, pos, kv_head, dim_chunk]
+
+Q = x [1, 2048] @ [2048, 2048] = [1, 2048]
+Q = x [1, 2048] @ [2048, 16, 128] = [1, 16, 128]
+
+K = x [1, 2048] @ [2048, 512] =  [1, 512]
+K = x [1, 2048] @ [2048, 16, 32] =  [1, 16, 32]
+
+V = x [1, 2048] @ [2048, 512] =  [1, 512]
+V = x [1, 2048] @ [2048, 16, 32] =  [1, 16, 32]
+
+Opcode 2: Partial attention
+  partition: by KV head, and optionally by sequence chunk
+  current schedule: 8 instructions total, one per KV head
+  each instruction:
+    reads 4 Q heads (because GQA ratio = 4)
+    streams K/V cache in 16-token blocks
+    produces 4 attention output heads
+
+Opcode 4: O projection
+  partition: hidden output blocks of 16 dims
+  each instruction reduces over the full 2048-dim attn_out
+  stores with add into hidden_states residual buffer
+
+Opcode 5: Up/Gate
+  partition: 512 intermediate blocks of 16 dims
+  SMs get strided block lists
+  each block computes both up and gate, then SiLU(gate) * up
+
+Opcode 6: Down projection
+  partition:
+    output hidden blocks of 16 dims
+    x 4 reduction columns of width 2048
+  each instruction owns one reduction column and a contiguous output range
+  stores with add into hidden_states
+
+Opcode 7: LM head
+  partition: vocab logits in 16-dim chunks
+
+#######################################
+###### SHARDING FOR ALL OPCODES #######
+#######################################
+
+Use this decode-time rule of thumb:
+
+```text
+Dense op in decode = GEMV, not big GEMM
+
+x: [K]
+W: [N, K]
+y = W @ x   -> [N]
+
+Equivalent GEMM view:
+X[1, K] @ W^T[K, N] = Y[1, N]
+```
+
+Then the scheduler can shard work three different ways:
+
+- `N-shard`: split output rows/columns. Independent. No cross-SM reduction.
+- `K-shard`: split reduction dimension. Produces partial sums. Needs additive combine/reduction.
+- `T-shard`: split attention sequence length. Produces partial attention results. Needs attention reduction if more than one partition.
+(for attention only because of KV T-reduction)
+
+That is the right mental model for all opcodes
+
+**Master View**
+```text
+Opcode 1: N-shard over concatenated QKV output
+Opcode 2: shard over KV head and optionally T
+Opcode 3: reduce over T-shards
+Opcode 4: N-shard over O projection output
+Opcode 5: N-shard over shared Up/Gate output tiles
+Opcode 6: N-shard + K-shard over Down projection
+Opcode 7: N-shard over vocab logits
+```
+
+**Opcode 1: `LayerNorm_QKV_MatVecRopeAppend`**
+The repo explicitly concatenates `Wq`, `Wk`, `Wv` into one stacked matrix
+
+```
+x                  : [2048]
+x_norm             : [2048]
+
+W_qkv_cat          : [3072, 2048]
+y_qkv = W_qkv_cat @ x_norm   : [3072]
+
+3072 = 2048 (Q) + 512 (K) + 512 (V)
+     = 128 blocks + 32 blocks + 32 blocks
+     = 192 blocks of size 16
+```
+
+Sharding:
+
+- Split only along `N=3072`.
+- Each instruction owns a contiguous range of 16-wide output tiles:
+  `start_output_block_idx .. end_output_block_idx`.
+- For each tile, it decides whether the tile belongs to Q, K, or V by offset, then:
+  - Q tile: apply RoPE, write to `post_ln_rope_q`
+  - K tile: apply RoPE, append to `k_cache`
+  - V tile: append to `v_cache`
+
+So this is:
+
+```
+N-sharded fused op
+RMSNorm + matvec tile + mode(Q/K/V) + optional RoPE + write destination
+```
+
+No cross-SM reduction. Each tile is final once computed.
+
+This is why the cost is `num_tiles * 16 * 2048`
+
+**Opcode 2: `PartialAttention`**
+This is not a weight GEMV. It is attention over cached sequence.
+
+For one KV head:
+
+```text
+Q group            : [4, 64]      because GQA ratio = 32 / 8 = 4
+K cache slice      : [T, 64]
+V cache slice      : [T, 64]
+
+scores             : [4, T]   = Q @ K^T
+out                : [4, 64]  = softmax(scores) @ V
+```
+
+Sharding:
+
+- Primary shard is by `kv_head_idx`:
+  8 KV-head instructions total in the common path.
+- Optional secondary shard is by sequence length `T`, in blocks of `attn_kv_block_size=16`.
+- Each instruction owns:
+  - one KV head
+  - one sequence partition `partial_idx`
+
+So this is:
+
+```text
+head-shard + optional T-shard
+```
+
+Common shipped path:
+
+- `num_attention_partitions = 1`
+- `skip_attn_reduction = True`
+
+So each instruction reads the full sequence for one KV head and 
+  directly writes the final 4-head attention output. No reduction in the common path.
+
+The cost reflects KV-cache traffic, not matvec flops
+
+**Opcode 3: `AttentionReduction`**
+FLASH-Attention.
+This only matters if opcode 2 used multiple sequence partitions.
+
+Each partial attention instruction would produce:
+
+- partial output vectors
+- partial log-sum-exp stats
+
+Then opcode 3 combines them for 4 Q heads at a time, matching `attn_reduction_size=4`
+
+So this is:
+
+```text
+explicit reduction over T-shards
+```
+
+This is the attention analog of K-shard reduction in a GEMM.
+
+**Opcode 4: `O_ProjResidual`**
+Logical math:
+
+```text
+attn_out           : [2048]
+W_o                : [2048, 2048]
+delta              : [2048] = W_o @ attn_out
+hidden_states     += delta
+```
+
+Sharding:
+
+- Split along output `N=2048` into `128` blocks of size `16`.
+- Current schedule uses `reduction_block_idx = 0` only, because `K=2048` fits in one full reduction chunk in [scheduler.py](/Users/dibakarbarua/Desktop/Code/Megakernels/megakernels/demos/latency/scheduler.py#L344).
+- So in practice this is pure `N-shard`, one output tile at a time.
+
+```text
+N-sharded matvec-add
+```
+
+No real cross-SM reduction in the current path. The “add” is just residual accumulation into the final destination.
+
+**Opcode 5: `LayerNormDoubleMatVecSiLU`**
+Logical math:
+
+```text
+x                  : [2048]
+x_norm             : [2048]
+
+up   = W_up   @ x_norm   : [8192]
+gate = W_gate @ x_norm   : [8192]
+
+silu_out = SiLU(gate) * up   : [8192]
+```
+
+This is the MLP “up” and “gate” branches fused together.
+
+Sharding:
+
+- Shared output dimension is `8192`.
+- Split into `512` tiles of size `16`.
+- Each instruction owns a list of output block indices.
+- For each tile index `b`, it computes:
+  - `up[b]`
+  - `gate[b]`
+  - applies `SiLU(gate[b]) * up[b]`
+  - writes final `silu_out[b]`
+
+This is not concatenation in memory like QKV, but it is the same scheduling idea:
+
+```text
+paired N-shard over two matrices with the same output tile index
+```
+
+No cross-SM reduction. The cost has the extra `*2` because it does two matvecs per tile in [instructions.py](/Users/dibakarbarua/Desktop/Code/Megakernels/megakernels/demos/latency/instructions.py#L137).
+
+**Opcode 6: `DownProjResidual`**
+
+########################################################
+This is the one dense op where K-sharding really matters.
+########################################################
+
+Logical math:
+
+```text
+silu_out           : [8192]
+W_down             : [2048, 8192]
+delta              : [2048] = W_down @ silu_out
+hidden_states     += delta
+```
+
+Now `K=8192` is too large to treat as one chunk in this scheduler. It splits the reduction dimension into four `2048`-wide pieces because `matvec_reduction_size=2048` in [scheduler.py](/Users/dibakarbarua/Desktop/Code/Megakernels/megakernels/demos/latency/scheduler.py#L109).
+
+So conceptually:
+
+```text
+delta =
+  W_down[:, 0:2048]    @ silu_out[0:2048]    +
+  W_down[:, 2048:4096] @ silu_out[2048:4096] +
+  W_down[:, 4096:6144] @ silu_out[4096:6144] +
+  W_down[:, 6144:8192] @ silu_out[6144:8192]
+```
+
+Sharding:
+
+- Split output `N=2048` into 128 tiles of 16
+- Split reduction `K=8192` into 4 chunks of 2048
+- Each instruction owns:
+  - one `reduction_block_idx` in `{0,1,2,3}`
+  - one contiguous range of output tiles
+
+So this is:
+
+```text
+N-shard + K-shard
+```
+
+This one does require cross-instruction combine: different instructions produce partial sums for the same output tile, and those are added into `hidden_states`.
+
+That is the main “real reduction across shards” dense opcode in the current schedule.
+
+**Opcode 7: `RMS_LM_Head`**
+Logical math:
+
+```text
+x                  : [2048]
+x_norm             : [2048]
+W_lm               : [128256, 2048]
+logits             : [128256] = W_lm @ x_norm
+```
+
+Sharding:
+
+- Split output vocab dimension `N=128256` into tiles of `16`
+- Each instruction owns a contiguous range of vocab tiles
+- It computes final logits for those vocab ids
+
+So this is again:
+
+```text
+N-sharded fused RMSNorm + matvec
+```
+
+No cross-SM reduction.
+
+**Per-SM Mental Model**
+A good per-SM model is:
+
+```
+SM picks a ready instruction
+  -> waits on barriers for required producer data
+  -> loads the needed input vector/slice
+  -> computes its assigned tiles
+  -> writes final tile or partial tile
+  -> increments barrier counters for consumers
+```
+
+Then, by opcode:
+
+- `1`: full `x_norm`, final Q/K/V tiles
+- `2`: one KV head group, maybe one sequence partition
+- `3`: reduce multiple attention partitions
+- `4`: one O-proj output tile
+- `5`: one set of Up/Gate output tiles
+- `6`: one down-proj reduction chunk over one output-tile range
+- `7`: one vocab-tile range
+
+**Compact Cheat Sheet**
+```
+Opcode 1  QKV fused:
+  y[3072] = W_qkv_cat[3072,2048] @ x_norm[2048]
+  shard on N only
+  no reduction
+
+Opcode 2  Partial attention:
+  out[4,64] from Q[4,64], K[T,64], V[T,64]
+  shard on KV head, optionally T
+  reduction only if T is partitioned
+
+Opcode 3  Attention reduction:
+  reduce partial attention outputs across T-shards
+  explicit reduction op
+
+Opcode 4  O projection:
+  y[2048] = W_o[2048,2048] @ attn_out[2048]
+  shard on N only
+  no reduction in current schedule
+
+Opcode 5  Up/Gate fused:
+  up[8192]   = W_up[8192,2048]   @ x_norm[2048]
+  gate[8192] = W_gate[8192,2048] @ x_norm[2048]
+  shard on N only
+  no reduction
+
+Opcode 6  Down projection:
+  y[2048] = W_down[2048,8192] @ silu_out[8192]
+  shard on N and K
+  partial sums must be added/reduced
+
+Opcode 7  LM head:
+  logits[128256] = W_lm[128256,2048] @ x_norm[2048]
+  shard on N only
+  no reduction
+```
+
+The shortest summary is:
+
+```text
+Most opcodes are output-tile sharding.
+Only DownProj is true dense K-sharding in the common path.
+Attention uses head/T sharding instead of weight-matrix K-sharding.
+```
